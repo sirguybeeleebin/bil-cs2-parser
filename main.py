@@ -16,7 +16,9 @@ class Settings(BaseSettings):
 
     APP_LOG_LEVEL: Literal["CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"] = "INFO"
     RABBITMQ_URL: str = "amqp://guest:guest@localhost/"
-    RABBITMQ_QUEUE_NAME: str = "games_flatten"
+    RABBITMQ_EXCHANGE: str = "cs2_events"
+    RABBITMQ_QUEUE_NAME: str = "cs2_events_queue"
+    RABBITMQ_ROUTING_KEY: str = "all_games_parsed"
     GAMES_RAW_DIR: Path = Path("../bil-cs2-data/games_raw")
     GAMES_FLATTEN_DIR: Path = Path("../bil-cs2-data/games_flatten")
 
@@ -24,17 +26,9 @@ class Settings(BaseSettings):
 log = logging.getLogger(__name__)
 
 
-# ------------------------------
-# CLI and Logging Setup
-# ------------------------------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Game Parser Service")
-    parser.add_argument(
-        "--env-file",
-        type=Path,
-        default=Path(".env"),
-        help="Path to environment file (default: .env)",
-    )
+    parser.add_argument("--env-file", type=Path, default=Path(".env"))
     return parser.parse_args()
 
 
@@ -49,9 +43,36 @@ def configure_logger(settings: Settings):
     )
 
 
-# ------------------------------
-# Core ETL Logic
-# ------------------------------
+def init_rabbitmq(settings: Settings):
+    params = pika.URLParameters(settings.RABBITMQ_URL)
+    connection = pika.BlockingConnection(params)
+    channel = connection.channel()
+    channel.exchange_declare(
+        exchange=settings.RABBITMQ_EXCHANGE, exchange_type="direct", durable=True
+    )
+    channel.queue_declare(queue=settings.RABBITMQ_QUEUE_NAME, durable=True)
+    channel.queue_bind(
+        exchange=settings.RABBITMQ_EXCHANGE,
+        queue=settings.RABBITMQ_QUEUE_NAME,
+        routing_key=settings.RABBITMQ_ROUTING_KEY,
+    )
+    return connection, channel
+
+
+def publish_to_rabbitmq(channel, settings: Settings):
+    event = {
+        "event_uuid": str(uuid.uuid4()),
+        "event_type": settings.RABBITMQ_ROUTING_KEY,
+    }
+    channel.basic_publish(
+        exchange=settings.RABBITMQ_EXCHANGE,
+        routing_key=settings.RABBITMQ_ROUTING_KEY,
+        body=json.dumps(event, ensure_ascii=False).encode(),
+        properties=pika.BasicProperties(delivery_mode=2),
+    )
+    log.info("📨 Published event → %s : %s", settings.RABBITMQ_ROUTING_KEY, event)
+
+
 def game_extractor(path_to_dir: Path):
     json_files = list(path_to_dir.glob("*.json"))
     if not json_files:
@@ -81,26 +102,21 @@ def flatten_game(game: dict) -> list[dict]:
     except Exception:
         log.warning("Skipping game %s: invalid begin_at", game_id)
         return []
-
     map_id = game.get("map", {}).get("id")
     if not map_id:
         return []
-
     match = game.get("match", {})
     league_id = match.get("league", {}).get("id")
     serie = match.get("serie", {})
     serie_id = serie.get("id")
     serie_tier = {"s": 1, "a": 2, "b": 3, "c": 4, "d": 5}.get(serie.get("tier"))
     tournament_id = match.get("tournament", {}).get("id")
-
     players = game.get("players", [])
     if len(players) != 10:
         return []
-
     dd_team_players = defaultdict(list)
     d_player_stat = {}
     d_teams = {}
-
     for p in players:
         p_id = p.get("player", {}).get("id")
         t_id = p.get("team", {}).get("id")
@@ -124,11 +140,9 @@ def flatten_game(game: dict) -> list[dict]:
         }
         dd_team_players[t_id].append(p_id)
         d_teams[t_id] = opp_id
-
     rounds = game.get("rounds", [])
     if len(rounds) < 16 or not rounds or rounds[0].get("round") != 1:
         return []
-
     games_flatten = []
     for t_id, p_ids in dd_team_players.items():
         if len(set(p_ids)) != 5:
@@ -137,7 +151,6 @@ def flatten_game(game: dict) -> list[dict]:
         if not t_opp_id or t_opp_id not in dd_team_players:
             continue
         p_opp_ids = dd_team_players[t_opp_id]
-
         for p_id in p_ids:
             for p_opp_id in p_opp_ids:
                 for rnd in rounds:
@@ -185,7 +198,6 @@ def flatten_game(game: dict) -> list[dict]:
 
 
 def process_games(settings: Settings) -> list[str]:
-    """Reads, flattens, and saves all game JSON files from local storage."""
     parsed_games = []
     for game in game_extractor(settings.GAMES_RAW_DIR):
         flat_data = flatten_game(game)
@@ -196,53 +208,18 @@ def process_games(settings: Settings) -> list[str]:
     return parsed_games
 
 
-# ------------------------------
-# RabbitMQ Publisher (sync pika)
-# ------------------------------
-def publish_to_rabbitmq(settings: Settings):
-    """Publish a message to RabbitMQ using pika (sync)."""
-    log.info("Connecting to RabbitMQ at %s...", settings.RABBITMQ_URL)
-    try:
-        params = pika.URLParameters(settings.RABBITMQ_URL)
-        connection = pika.BlockingConnection(params)
-        channel = connection.channel()
-        channel.queue_declare(queue=settings.RABBITMQ_QUEUE_NAME, durable=True)
-
-        event_uuid = str(uuid.uuid4())
-        message = {
-            "event": "all_games_parsed",
-            "status": "completed",
-            "event_uuid": event_uuid,
-        }
-
-        body = json.dumps(message, ensure_ascii=False)
-        channel.basic_publish(
-            exchange="",
-            routing_key=settings.RABBITMQ_QUEUE_NAME,
-            body=body.encode(),
-            properties=pika.BasicProperties(delivery_mode=2),  # make message persistent
-        )
-
-        log.info("📨 Published event to RabbitMQ: %s", event_uuid)
-        log.info("✅ Message published successfully.")
-
-    except Exception as e:
-        log.exception("Error publishing to RabbitMQ: %s", e)
-
-    finally:
-        try:
-            connection.close()
-            log.info("RabbitMQ connection closed.")
-        except Exception:
-            pass
-
-
 def main():
     args = parse_args()
     settings = parse_env_file(args.env_file)
     configure_logger(settings)
-    process_games(settings)
-    publish_to_rabbitmq(settings)
+    connection, channel = init_rabbitmq(settings)
+    try:
+        parsed_games = process_games(settings)
+        log.info("✅ Parsed %d games.", len(parsed_games))
+        publish_to_rabbitmq(channel, settings)
+    finally:
+        connection.close()
+        log.info("🐇 RabbitMQ connection closed.")
 
 
 if __name__ == "__main__":

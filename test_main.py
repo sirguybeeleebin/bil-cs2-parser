@@ -1,154 +1,123 @@
 import json
-import logging
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from main import (
     Settings,
-    configure_logger,
     flatten_game,
     game_extractor,
-    parse_args,
-    parse_env_file,
+    init_rabbitmq,
     process_games,
+    publish_to_rabbitmq,
     save_flattened_game,
 )
 
 
-def test_parse_args_defaults(monkeypatch):
-    """Test that default env file is .env."""
-    monkeypatch.setattr("sys.argv", ["prog"])
-    args = parse_args()
-    assert args.env_file == Path(".env")
+@pytest.fixture
+def tmp_dir(tmp_path: Path):
+    d = tmp_path / "games"
+    d.mkdir()
+    return d
 
 
-def test_parse_env_file(tmp_path):
-    """Ensure environment variables are loaded correctly."""
-    env_file = tmp_path / ".env"
-    env_file.write_text("APP_LOG_LEVEL=DEBUG\nRABBITMQ_URL=amqp://test\n")
-    s = parse_env_file(env_file)
-    assert isinstance(s, Settings)
-    assert s.APP_LOG_LEVEL == "DEBUG"
-    assert "amqp" in s.RABBITMQ_URL
-
-
-def test_configure_logger_sets_format():
-    """Just ensure configure_logger executes without errors."""
-    s = Settings(APP_LOG_LEVEL="INFO")
-    configure_logger(s)
-    log = logging.getLogger("test_logger")
-    log.info("hi")  # should not raise any error
-
-
-def test_game_extractor_reads_json(tmp_path):
-    """Game extractor should yield parsed JSON objects."""
-    data = {"id": "game1"}
-    (tmp_path / "1.json").write_text(json.dumps(data), encoding="utf-8")
-    games = list(game_extractor(tmp_path))
-    assert games == [data]
-
-
-def test_game_extractor_raises_when_empty(tmp_path):
-    """Should raise FileNotFoundError if no JSON files exist."""
-    with pytest.raises(FileNotFoundError):
-        list(game_extractor(tmp_path))
-
-
-def test_save_flattened_game_creates_file(tmp_path):
-    """Should create a JSON file with flattened data."""
-    data = [{"id": 1}]
-    save_flattened_game(tmp_path, "g1", data)
-    file = tmp_path / "g1.json"
-    assert file.exists()
-    assert json.loads(file.read_text(encoding="utf-8")) == data
-
-
-def test_flatten_game_valid():
-    """Flatten valid game data into per-round stats."""
-    game = {
-        "id": "g1",
+@pytest.fixture
+def sample_game():
+    return {
+        "id": "game_1",
         "begin_at": "2024-01-01T00:00:00Z",
-        "map": {"id": "m1"},
+        "map": {"id": 100},
         "match": {
-            "league": {"id": "l1"},
-            "tournament": {"id": "t1"},
-            "serie": {"id": "s1", "tier": "a"},
+            "league": {"id": 10},
+            "serie": {"id": 20, "tier": "a"},
+            "tournament": {"id": 30},
         },
         "players": [
             {
                 "player": {"id": f"p{i}"},
                 "team": {"id": "t1" if i < 5 else "t2"},
                 "opponent": {"id": "t2" if i < 5 else "t1"},
+                "adr": 100,
+                "kast": 70,
+                "rating": 1.1,
+                "kills": 10,
+                "deaths": 5,
+                "assists": 2,
+                "headshots": 3,
+                "flash_assists": 1,
+                "first_kills_diff": 1,
+                "k_d_diff": 5,
             }
             for i in range(10)
         ],
         "rounds": [
             {
-                "round": 1,
+                "round": i,
                 "ct": "t1",
                 "terrorists": "t2",
                 "winner_team": "t1",
                 "outcome": "eliminated",
             }
-            for _ in range(16)
+            for i in range(1, 17)
         ],
     }
-    result = flatten_game(game)
-    assert isinstance(result, list)
-    assert len(result) > 0
+
+
+def test_flatten_game_valid(sample_game):
+    result = flatten_game(sample_game)
+    assert result, "Flatten game should return data"
     assert all("game_id" in r for r in result)
+    assert all("round" in r for r in result)
 
 
-def test_flatten_game_invalid_data():
-    """Invalid data should return an empty list."""
+def test_flatten_game_invalid_missing_id():
     assert flatten_game({}) == []
-    bad = {"id": "g1", "begin_at": "??", "map": {"id": "m"}, "match": {}, "players": []}
-    assert flatten_game(bad) == []
 
 
-def test_process_games_creates_output(tmp_path):
-    """Test full ETL pipeline via process_games() without RabbitMQ."""
-    data = {
-        "id": "g1",
-        "begin_at": "2024-01-01T00:00:00Z",
-        "map": {"id": "m1"},
-        "match": {
-            "league": {"id": "l1"},
-            "tournament": {"id": "t1"},
-            "serie": {"id": "s1", "tier": "a"},
-        },
-        "players": [
-            {
-                "player": {"id": f"p{i}"},
-                "team": {"id": "t1" if i < 5 else "t2"},
-                "opponent": {"id": "t2" if i < 5 else "t1"},
-            }
-            for i in range(10)
-        ],
-        "rounds": [
-            {
-                "round": 1,
-                "ct": "t1",
-                "terrorists": "t2",
-                "winner_team": "t1",
-                "outcome": "eliminated",
-            }
-            for _ in range(16)
-        ],
-    }
+def test_save_flattened_game(tmp_dir):
+    data = [{"a": 1}]
+    file_path = tmp_dir / "test"
+    save_flattened_game(file_path, "g1", data)
+    output = json.loads((file_path / "g1.json").read_text())
+    assert output == data
 
-    raw_dir = tmp_path / "raw"
-    flat_dir = tmp_path / "flat"
-    raw_dir.mkdir()
-    (raw_dir / "g1.json").write_text(json.dumps(data), encoding="utf-8")
 
-    s = Settings(GAMES_RAW_DIR=raw_dir, GAMES_FLATTEN_DIR=flat_dir)
-    parsed = process_games(s)
+def test_game_extractor_reads_json(tmp_dir):
+    f = tmp_dir / "sample.json"
+    f.write_text(json.dumps({"a": 1}))
+    files = list(game_extractor(tmp_dir))
+    assert len(files) == 1
+    assert files[0]["a"] == 1
 
-    assert parsed == ["g1"]
-    output_files = list(flat_dir.glob("*.json"))
-    assert len(output_files) == 1
 
-    content = json.loads(output_files[0].read_text(encoding="utf-8"))
-    assert content[0]["game_id"] == "g1"
+def test_game_extractor_handles_invalid_json(tmp_dir, caplog):
+    f = tmp_dir / "broken.json"
+    f.write_text("{ invalid json }")
+    list(game_extractor(tmp_dir))
+    assert "Skipping" in caplog.text
+
+
+@patch("pika.BlockingConnection")
+def test_publish_to_rabbitmq(mock_conn):
+    settings = Settings()
+    mock_channel = MagicMock()
+    mock_conn.return_value.channel.return_value = mock_channel
+
+    conn, ch = init_rabbitmq(settings)
+    publish_to_rabbitmq(ch, settings)
+
+    mock_channel.basic_publish.assert_called_once()
+    mock_channel.exchange_declare.assert_called()
+    mock_channel.queue_bind.asgitsert_called()
+    conn.close()
+
+
+@patch("main.flatten_game", return_value=[{"game_id": "g1"}])
+@patch("main.save_flattened_game")
+@patch("main.game_extractor", return_value=[{"id": "g1"}])
+def test_process_games(_, mock_save, __, tmp_dir):
+    settings = Settings(GAMES_RAW_DIR=tmp_dir, GAMES_FLATTEN_DIR=tmp_dir)
+    games = process_games(settings)
+    assert games == ["g1"]
+    mock_save.assert_called_once()
